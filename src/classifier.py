@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
 from typing import List
-
+import nltk
+from nltk.corpus import stopwords
+nltk.download('stopwords')
 import torch
 from torch import nn
 from torch.optim import AdamW
@@ -10,82 +12,72 @@ from transformers import AutoModel, AutoTokenizer
 
 
 COLUMN_NAMES = ["sentiment", "aspect_category", "aspect_term", "position", "sentence"]
-CATEGORY_NAMES = ['AMBIENCE#GENERAL', 'DRINKS#PRICES', 'DRINKS#QUALITY',
-                  'DRINKS#STYLE_OPTIONS', 'FOOD#PRICES', 'FOOD#QUALITY',
-                  'FOOD#STYLE_OPTIONS', 'LOCATION#GENERAL', 'RESTAURANT#GENERAL',
-                  'RESTAURANT#MISCELLANEOUS', 'RESTAURANT#PRICES', 'SERVICE#GENERAL']
-NUM_CATEGORIES = 12
-MAX_LENGTH = 60
-BATCH_SIZE = 8
-LEARNING_RATE = 0.1
-EPOCHS = 1
+MAX_LENGTH = 64
+BATCH_SIZE = 16
+LEARNING_RATE = 2e-5
+EPOCHS = 10
 EMBEDDING_SIZE = 768
 TRAIN_SAMPLES = 1503
 VALID_SAMPLES = 376
-PATH = "bert_model.pt"
+STOP_WORDS = set(stopwords.words('english'))
+PLM_NAME = 'activebus/BERT_Review'
+PATH = "model.pt"
 
 
-def generate_target_and_category(df):
+def remove_stopwords(text):
+    stopwords = STOP_WORDS
+    text = text.lower()
+    words = text.split()
+    filtered_words = [word for word in words if word not in stopwords]
+    return " ".join(filtered_words)
+
+def preprocess(df):
     df["target"] = np.nan
     df.loc[df.sentiment == "positive", "target"] = 0
     df.loc[df.sentiment == "negative", "target"] = 1
     df.loc[df.sentiment == "neutral", "target"] = 2
-    df_new = pd.get_dummies(df.aspect_category)
-    existing_columns = set(df_new.columns)
-    for column in CATEGORY_NAMES:
-        if column in existing_columns:
-            df[column] = df_new[column]
-        else:
-            df[column] = 0
-
     df["aspect_category"] = df["aspect_category"].str.lower().str.replace("#", "-")
+    # Stop words removing
+    df['sentence'] = df['sentence'].apply(remove_stopwords)
+    # Concatenating ensures that aspect terms and categories are treated as a single unit
     df["sentence"] = df["aspect_category"] + "-" + df["aspect_term"] + ": " + df["sentence"]
     return df
 
 
-class SentimentClassifier(nn.Module):
+class BertClassifier(nn.Module):
     def __init__(self, n_classes, device):
-        super(SentimentClassifier, self).__init__()
-        self.encoder = AutoModel.from_pretrained(
-            "activebus/BERT_Review", output_hidden_states=True)
+        super(BertClassifier, self).__init__()
         self.device = device
-        self.elu1 = nn.ELU()
-        self.drop1 = nn.Dropout(p=0.3)
-        self.fc1 = nn.Linear(EMBEDDING_SIZE+NUM_CATEGORIES, 300)
-        self.elu2 = nn.ELU()
-        self.drop2 = nn.Dropout(p=0.3)
-        self.fc2 = nn.Linear(300+NUM_CATEGORIES, n_classes)
+        self.encoder = AutoModel.from_pretrained(PLM_NAME, output_hidden_states=True)
+        self.classifier = torch.nn.Sequential(
+                torch.nn.ReLU(),
+                torch.nn.Dropout(0.3),
+                torch.nn.Linear(EMBEDDING_SIZE,384),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(0.3),
+                torch.nn.Linear(384, 96),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(0.3),
+                torch.nn.Linear(96,n_classes))
 
-    def forward(self, input_ids, attention_mask, category_dummies):
-        hidden_states = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-            ).hidden_states
-
-        num_batches = len(hidden_states[0])
-        sentence_embedding = torch.zeros(num_batches, EMBEDDING_SIZE)
-        sentence_embedding = sentence_embedding.to(self.device)
+    def forward(self, input_ids, attention_mask):
+        hidden_states = self.encoder(input_ids=input_ids, attention_mask=attention_mask).hidden_states
+        sentence_embedding = torch.zeros(len(hidden_states[0]), EMBEDDING_SIZE).to(self.device)
+        
+        # Avg of last four layers (most informative in BERT) to create sentence vector for classification
         for layer in hidden_states[-4:]:
-            layer_embedding = torch.mean(layer, dim=1)  # sentence vector of the layer
+            layer_embedding = torch.mean(layer, dim=1)
             sentence_embedding += layer_embedding
-
-        sentence_embedding /= 4  # average sentence vector
-        next_input = torch.cat((sentence_embedding, category_dummies), dim=1)
-        next_input = self.elu1(next_input)
-        next_input = self.drop1(next_input)
-        next_input = self.fc1(next_input)
-        next_input = self.elu2(next_input)
-        next_input = self.drop2(next_input)
-        next_input = torch.cat((next_input, category_dummies), dim=1)
-        output = self.fc2(next_input)
+        sentence_embedding /= 4
+        
+        output = self.classifier(sentence_embedding)
         return output
 
 
-class ABSA_Dataset(Dataset):
-    def __init__(self, data_frame, tokenizer, max_length):
-        self._sentences = data_frame["sentence"]
-        self._targets = torch.tensor(data_frame["target"], dtype=torch.long)
-        self._category_dummies = data_frame[CATEGORY_NAMES].to_numpy()
+class Dataset(Dataset):
+    def __init__(self, df, tokenizer, max_length):
+        self._sentences = df["sentence"]
+        self._targets = torch.tensor(df["target"], dtype=torch.long)
         self._tokenizer = tokenizer
         self._max_length = max_length
 
@@ -93,9 +85,8 @@ class ABSA_Dataset(Dataset):
         return len(self._targets)
 
     def __getitem__(self, item):
-        text = self._sentences[item]
         target = self._targets[item]
-        category_dummies = self._category_dummies[item, :]
+        text = self._sentences[item]
         encoded_text = self._tokenizer.encode_plus(
             text,
             return_tensors='pt',
@@ -104,42 +95,40 @@ class ABSA_Dataset(Dataset):
             padding='max_length',
             add_special_tokens=True,
             return_token_type_ids=False,
-            return_attention_mask=True,
-            )
+            return_attention_mask=True)
     
         bert_dict = dict()
-        bert_dict["category_dummies"] = category_dummies
         bert_dict["targets"] = target
         bert_dict["input_ids"] = encoded_text["input_ids"][0]
         bert_dict["attention_mask"] = encoded_text["attention_mask"][0]
         return bert_dict
 
+
 class Classifier:
     """The Classifier"""
     def __init__(self):
-        # https://huggingface.co/activebus/BERT_Review
-        self.tokenizer = AutoTokenizer.from_pretrained("activebus/BERT_Review")
+        self.tokenizer = AutoTokenizer.from_pretrained(PLM_NAME)
     
     def train(self, train_filename: str, dev_filename: str, device: torch.device):
         """
         Trains the classifier model on the training set stored in file trainfile.
         """
-        model = SentimentClassifier(3, device)
+        model = BertClassifier(3, device)
         
         # split columns into 'sentiment'' aspect_category' 'aspect_term' 'position'	'sentence'
         train_file = pd.read_csv(train_filename, delimiter="\t", names=COLUMN_NAMES, header=None)
         valid_file = pd.read_csv(dev_filename, delimiter="\t", names=COLUMN_NAMES, header=None)
         
         # turn 'sentiment' into numerical variable 'target' and turn category into dummy variable
-        train_file = generate_target_and_category(train_file)
-        valid_file = generate_target_and_category(valid_file)
+        train_file = preprocess(train_file)
+        valid_file = preprocess(valid_file)
         
         # tokenize both train & validation set
-        train_dataset = ABSA_Dataset(data_frame=train_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
-        valid_dataset = ABSA_Dataset(data_frame=valid_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
+        train_dataset = Dataset(df=train_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
+        valid_dataset = Dataset(df=valid_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
         
         # data loading
-        train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+        train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=2)
         valid_dataloader = DataLoader(valid_dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=2)
         
         # hyperparameters for the classifier
@@ -147,13 +136,10 @@ class Classifier:
         optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
         criterion = nn.CrossEntropyLoss().to(device)
         epochs = EPOCHS
-
+        
         valid_loss_min = np.Inf
         for epoch in range(1, epochs + 1):
             model.train()
-            if epoch == 1:
-                for param in model.encoder.parameters():
-                    param.requires_grad = False
 
             train_loss = 0.0
             train_correct_predictions = 0
@@ -161,9 +147,8 @@ class Classifier:
                 input_ids = batch_dict["input_ids"].to(device)
                 attention_mask = batch_dict["attention_mask"].to(device)
                 targets = batch_dict["targets"].to(device)
-                category_dummies = batch_dict["category_dummies"].to(device)
                 optimizer.zero_grad()
-                output = model(input_ids, attention_mask, category_dummies)
+                output = model(input_ids, attention_mask)
                 _, preds = torch.max(output, dim=1)
 
                 train_correct_predictions += torch.sum(preds == targets)
@@ -179,8 +164,7 @@ class Classifier:
                 input_ids = batch_dict["input_ids"].to(device)
                 attention_mask = batch_dict["attention_mask"].to(device)
                 targets = batch_dict["targets"].to(device)
-                category_dummies = batch_dict["category_dummies"].to(device)
-                output = model(input_ids, attention_mask, category_dummies)
+                output = model(input_ids, attention_mask)
                 _, preds = torch.max(output, dim=1)
 
                 valid_correct_predictions += torch.sum(preds == targets)
@@ -198,8 +182,7 @@ class Classifier:
                   f"Validation_loss: {valid_loss:.6f}. " \
                   f"Train accuracy: {train_accuracy:.2f}. " \
                   f"Valid accuracy: {valid_accuracy:.2f}.")
-
-            # saving the model if validation loss has decreased
+        
             if valid_loss < valid_loss_min:
                 print(f"Validation loss decreased ({valid_loss_min:.6f} --> " \
                       f"{valid_loss:.6f}). Saving model..")
@@ -213,13 +196,13 @@ class Classifier:
         Returns the list of predicted labels
         """
         test_file = pd.read_csv(data_filename, delimiter="\t", names=COLUMN_NAMES, header=None)
-        test_file = generate_target_and_category(test_file)
-        test_dataset = ABSA_Dataset(data_frame=test_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
+        test_file = preprocess(test_file)
+        test_dataset = Dataset(df=test_file, tokenizer=self.tokenizer, max_length=MAX_LENGTH)
         test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=2)
         predictions = []
         predictions_dict = {0: "positive", 1: "negative", 2: "neutral"}
 
-        model = SentimentClassifier(3, device)
+        model = BertClassifier(3, device)
         model.load_state_dict(torch.load(PATH))
         model = model.to(device)
         model.eval()
@@ -227,8 +210,7 @@ class Classifier:
         for batch_dict in test_dataloader:
             input_ids = batch_dict["input_ids"].to(device)
             attention_mask = batch_dict["attention_mask"].to(device)
-            category_dummies = batch_dict["category_dummies"].to(device)
-            output = model(input_ids, attention_mask, category_dummies)
+            output = model(input_ids, attention_mask)
             _, preds = torch.max(output, dim=1)
 
             for prediction in preds.detach().cpu().numpy():

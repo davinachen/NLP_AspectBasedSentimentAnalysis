@@ -1,35 +1,23 @@
 import numpy as np
 import pandas as pd
 from typing import List
-import nltk
-from nltk.corpus import stopwords
-nltk.download('stopwords')
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoModel, AutoTokenizer
+from transformers import RobertaConfig, RobertaForMaskedLM, RobertaTokenizer
 
 
 COLUMN_NAMES = ["sentiment", "aspect_category", "aspect_term", "position", "sentence"]
 MAX_LENGTH = 64
-BATCH_SIZE = 16
+BATCH_SIZE = 12
 LEARNING_RATE = 2e-5
-EPOCHS = 10
+EPOCHS = 5
 EMBEDDING_SIZE = 768
 TRAIN_SAMPLES = 1503
 VALID_SAMPLES = 376
-STOP_WORDS = set(stopwords.words('english'))
-PLM_NAME = 'activebus/BERT_Review'
 PATH = "model.pt"
 
-
-def remove_stopwords(text):
-    stopwords = STOP_WORDS
-    text = text.lower()
-    words = text.split()
-    filtered_words = [word for word in words if word not in stopwords]
-    return " ".join(filtered_words)
 
 def preprocess(df):
     df["target"] = np.nan
@@ -37,38 +25,38 @@ def preprocess(df):
     df.loc[df.sentiment == "negative", "target"] = 1
     df.loc[df.sentiment == "neutral", "target"] = 2
     df["aspect_category"] = df["aspect_category"].str.lower().str.replace("#", "-")
-    # Stop words removing
-    df['sentence'] = df['sentence'].apply(remove_stopwords)
     # Concatenating ensures that aspect terms and categories are treated as a single unit
     df["sentence"] = df["aspect_category"] + "-" + df["aspect_term"] + ": " + df["sentence"]
     return df
 
 
-class BertClassifier(nn.Module):
+class RobertaClassifier(nn.Module):
     def __init__(self, n_classes, device):
-        super(BertClassifier, self).__init__()
+        super(RobertaClassifier, self).__init__()
         self.device = device
-        self.encoder = AutoModel.from_pretrained(PLM_NAME, output_hidden_states=True)
+        self.configuration = RobertaConfig()
+        self.configuration.output_hidden_states = True
+        self.encoder = RobertaForMaskedLM.from_pretrained('roberta-base', output_hidden_states=True)
         self.classifier = torch.nn.Sequential(
                 torch.nn.ReLU(),
-                torch.nn.Dropout(0.3),
+                torch.nn.Dropout(0.2),
                 torch.nn.Linear(EMBEDDING_SIZE,384),
                 torch.nn.ReLU(),
-                torch.nn.Dropout(0.3),
-                torch.nn.Linear(384, 96),
+                torch.nn.Dropout(0.2),
+                torch.nn.Linear(384, 192),
                 torch.nn.ReLU(),
-                torch.nn.Dropout(0.3),
-                torch.nn.Linear(96,n_classes))
+                torch.nn.Dropout(0.2),
+                torch.nn.Linear(192,n_classes))
 
     def forward(self, input_ids, attention_mask):
         hidden_states = self.encoder(input_ids=input_ids, attention_mask=attention_mask).hidden_states
         sentence_embedding = torch.zeros(len(hidden_states[0]), EMBEDDING_SIZE).to(self.device)
         
-        # Avg of last four layers (most informative in BERT) to create sentence vector for classification
-        for layer in hidden_states[-4:]:
+        # Avg of last five layers (most informative in BERT) to create sentence vector for classification
+        for layer in hidden_states[-5:]:
             layer_embedding = torch.mean(layer, dim=1)
             sentence_embedding += layer_embedding
-        sentence_embedding /= 4
+        sentence_embedding /= 5
         
         output = self.classifier(sentence_embedding)
         return output
@@ -97,23 +85,23 @@ class Dataset(Dataset):
             return_token_type_ids=False,
             return_attention_mask=True)
     
-        bert_dict = dict()
-        bert_dict["targets"] = target
-        bert_dict["input_ids"] = encoded_text["input_ids"][0]
-        bert_dict["attention_mask"] = encoded_text["attention_mask"][0]
-        return bert_dict
+        roberta_dict = dict()
+        roberta_dict["targets"] = target
+        roberta_dict["input_ids"] = encoded_text["input_ids"][0]
+        roberta_dict["attention_mask"] = encoded_text["attention_mask"][0]
+        return roberta_dict
 
 
 class Classifier:
     """The Classifier"""
     def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(PLM_NAME)
+        self.tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     
     def train(self, train_filename: str, dev_filename: str, device: torch.device):
         """
         Trains the classifier model on the training set stored in file trainfile.
         """
-        model = BertClassifier(3, device)
+        model = RobertaClassifier(3, device)
         
         # split columns into 'sentiment'' aspect_category' 'aspect_term' 'position'	'sentence'
         train_file = pd.read_csv(train_filename, delimiter="\t", names=COLUMN_NAMES, header=None)
@@ -137,7 +125,7 @@ class Classifier:
         criterion = nn.CrossEntropyLoss().to(device)
         epochs = EPOCHS
         
-        valid_loss_min = np.Inf
+        valid_accuracy_max = 0.0
         for epoch in range(1, epochs + 1):
             model.train()
 
@@ -183,12 +171,12 @@ class Classifier:
                   f"Train accuracy: {train_accuracy:.2f}. " \
                   f"Valid accuracy: {valid_accuracy:.2f}.")
         
-            if valid_loss < valid_loss_min:
-                print(f"Validation loss decreased ({valid_loss_min:.6f} --> " \
-                      f"{valid_loss:.6f}). Saving model..")
+            if valid_accuracy > valid_accuracy_max:
+                print(f"Validation accuracy increased ({valid_accuracy_max:.6f} --> " \
+                      f"{valid_accuracy:.6f}). Saving model..")
                 torch.save(model.state_dict(), PATH)
                 print("Model Saved")
-                valid_loss_min = valid_loss
+                valid_accuracy_max = valid_accuracy
 
 
     def predict(self, data_filename: str, device: torch.device) -> List[str]:
@@ -202,7 +190,7 @@ class Classifier:
         predictions = []
         predictions_dict = {0: "positive", 1: "negative", 2: "neutral"}
 
-        model = BertClassifier(3, device)
+        model = RobertaClassifier(3, device)
         model.load_state_dict(torch.load(PATH))
         model = model.to(device)
         model.eval()

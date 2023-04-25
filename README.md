@@ -17,10 +17,8 @@ We took care of all the training with our class Classifier. This class calls on 
 
 5. Results
 The final model achieves a mean accuracy of 85.74, indicating good generalization to new data. 
-
 Dev accs: [85.37, 84.84, 86.17, 87.23, 85.11]
 Mean Dev Acc.: 85.74 (0.87)
-
 Exec time: 1245.56 s. ( 249 per run )
 
 6. Usage

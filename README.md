@@ -11,8 +11,8 @@ The dataset used in this project is a collection of customer reviews in the rest
 
 4. Training —— We took care of all the training with our class Classifier. This class calls on the previously defined classes through its train function. It also defines the forward and backward passes. The model is trained using the AdamW optimizer with a learning rate of 2e-5, a cross-entropy loss function, and a batch size of 12. The training process runs for 5 epochs, and the best model is saved based on validation set performance. The data is split into 80% training and 20% validation.
 
-5. Results —— The final model achieves a mean accuracy of 85.74, indicating good generalization to new data.
-/nDev accs: [85.37, 84.84, 86.17, 87.23, 85.11]
-/nMean Dev Acc.: 85.74 (0.87)
+5. Results —— The final model achieves a mean accuracy of 85.74, indicating good generalization to new data. 
+- Dev accs: [85.37, 84.84, 86.17, 87.23, 85.11] 
+- Mean Dev Acc.: 85.74 (0.87)
 
 6. Usage —— To use the trained classifier to predict the sentiment of a new review, simply instantiate a Classifier object and call its predict method with the review text as input. The predict method returns a string representing the predicted sentiment category ("positive", "negative", or "neutral"). The classifier can also be retrained on new data by calling its train method with the paths to the new training and validation data files.
